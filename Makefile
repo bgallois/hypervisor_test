@@ -1,5 +1,5 @@
 obj-m += hypervisor_module.o
-hypervisor_module-y := src/hypervisor_module.o src/libhypervisor_test.o
+hypervisor_module-y := src/hypervisor_module.o src/libhypervisor_test.o src/virt_to_phys_shim.o
 
 KERNELDIR :=./linux/ # Should be replaced to the kernel build
 PWD := $(shell pwd)
@@ -8,6 +8,8 @@ RUST_RELEASE := release
 RUST_LIB_NAME := hypervisor_test
 RUST_LIB_PATH := target/$(RUST_RELEASE)/lib$(RUST_LIB_NAME).a
 RUST_FILES := src/*.rs
+
+-include $(RUST_LIB_PATH:.a=.d)
 
 all: hypervisor_module.ko
 
