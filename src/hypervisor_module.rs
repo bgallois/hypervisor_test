@@ -1,16 +1,13 @@
 #![allow(missing_docs)]
 use kernel::prelude::*;
-//use kernel::page::Page;
-//use kernel::page::PAGE_SHIFT;
+use kernel::alloc::Allocator;
+use kernel::page::PAGE_SIZE;
 
 extern "C" {
     pub fn load_hypervisor(virt: *mut u32, phys: u64) -> i32;
 }
 extern "C" {
     fn rust_virt_to_phys(ptr: *const core::ffi::c_void) -> u64;
-}
-extern "C" {
-    fn linux_kmalloc(size: usize) -> *mut u8;
 }
 
 module! {
@@ -21,21 +18,31 @@ module! {
     license: "GPL",
 }
 
-struct Hypervisor;
+struct Hypervisor {
+    phys: u64,
+}
 
 impl kernel::Module for Hypervisor {
     fn init(_module: &'static ThisModule) -> Result<Self> {
 
         // Allocate one page of memory (disabled due to linking error during module load).
-        // let page = Page::alloc_page(GFP_KERNEL); // Should work, but causes unresolved symbol at module loading
         // Get the physical address directly from the Page abstraction (available in kernel 6.15+).
         // let phys = Page::into_phys(page); // Will be available in kernel 6.15+
-        // let virt = page.as_ptr() as *mut u32;
 
         // This should be possible to do it pure Rust see top.
-        let virt = unsafe {linux_kmalloc(1usize) };
-        let phys = unsafe { rust_virt_to_phys(virt as *const core::ffi::c_void) };
-        let res = unsafe {load_hypervisor(virt as *mut u32, phys)};
-        Ok(Hypervisor)
+        pr_info!("Starting Allocation\n");
+        let layout = unsafe { core::alloc::Layout::from_size_align_unchecked(1, PAGE_SIZE) };
+        let virt = kernel::alloc::allocator::Kmalloc::alloc(layout, GFP_KERNEL | __GFP_ZERO)?;
+        let virt_pts = virt.as_ptr();
+        pr_info!("Page Allocated\n");
+        let phys = unsafe { rust_virt_to_phys(virt_pts as *const core::ffi::c_void) };
+        let res = unsafe {load_hypervisor(virt_pts as *mut u32, phys)};
+        if res == 0 {
+            pr_info!("Hypervisor Started\n");
+        }
+        else {
+            pr_info!("Hypervisor Failed {} \n", res);
+        }
+        Ok(Hypervisor{phys})
     }
 }

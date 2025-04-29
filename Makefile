@@ -1,7 +1,7 @@
 obj-m += hypervisor_module.o
 hypervisor_module-y := src/hypervisor_module.o src/libhypervisor_test.o src/virt_to_phys_shim.o
 
-KERNELDIR :=./linux/ # Should be replaced to the kernel build
+KERNELDIR :=../linux # Should be replaced to the kernel build
 PWD := $(shell pwd)
 
 RUST_RELEASE := release

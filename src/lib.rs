@@ -1,8 +1,13 @@
+#![doc = include_str!("../README.md")]
 #![no_std]
-#![warn(missing_docs)]
 
 use core::panic::PanicInfo;
 
+/// Custom panic handler required in `#![no_std]` environments.
+///
+/// In kernel modules or bare-metal code, we define our own panic handler
+/// since the standard library is unavailable. This implementation simply
+/// enters an infinite loop.
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {}
@@ -10,15 +15,34 @@ fn panic(_info: &PanicInfo) -> ! {
 
 pub mod vmx;
 
+/// Entry point to load and run the hypervisor logic.
+///
+/// # Safety
+/// This function is marked as `unsafe` and `extern "C"` because it is
+/// called from C code (the kernel module entry point). It expects:
+/// - `virt`: A virtual address pointer to the allocated VMXON region.
+/// - `phys`: A physical address of the same region.
+///
+/// Returns:
+/// - `0` on success
+/// - An error code if any part of the process fails
+///
+/// The function:
+/// 1. Builds a new `Hypervisor` instance.
+/// 2. Enables VMX operation with the given memory region.
+/// 3. Disables VMX on completion to clean up.
 #[unsafe(no_mangle)]
 pub extern "C" fn load_hypervisor(virt: *mut u32, phys: u64) -> i32 {
     let hypervisor = match vmx::HypervisorBuilder::build() {
         Ok(hypervisor) => hypervisor,
-        Err(_) => return -1,
+        Err(e) => return e as i32,
     };
-    if hypervisor.enable(virt, phys).is_ok() {
-        0
-    } else {
-        -1
+    match hypervisor.enable(virt, phys) {
+        Ok(_) => 0,
+        Err(e) => return e as i32,
+    };
+    match hypervisor.disable() {
+        Ok(_) => 0,
+        Err(e) => e as i32,
     }
 }
