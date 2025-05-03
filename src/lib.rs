@@ -13,6 +13,7 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+pub mod vmcs;
 pub mod vmx;
 
 /// Entry point to load and run the hypervisor logic.
@@ -32,17 +33,27 @@ pub mod vmx;
 /// 2. Enables VMX operation with the given memory region.
 /// 3. Disables VMX on completion to clean up.
 #[unsafe(no_mangle)]
-pub extern "C" fn load_hypervisor(virt: *mut u32, phys: u64) -> i32 {
+pub extern "C" fn load_hypervisor(
+    virt_vmx: *mut u32,
+    phys_vmx: u64,
+    virt_vmcs: *mut u32,
+    phys_vmcs: u64,
+    virt_stack: *mut u32,
+    stack_top: u64,
+    guest: u64,
+    virt_gdt: *mut u32,
+    virt_tss: *mut u32,
+) -> i32 {
     let hypervisor = match vmx::HypervisorBuilder::build() {
         Ok(hypervisor) => hypervisor,
-        Err(e) => return e as i32,
+        Err(e) => return e.repr(),
     };
-    match hypervisor.enable(virt, phys) {
+    match hypervisor.enable(virt_vmx, phys_vmx) {
         Ok(_) => 0,
-        Err(e) => return e as i32,
+        Err(e) => return e.repr() + 100,
     };
-    match hypervisor.disable() {
+    match hypervisor.load_vm(virt_vmcs, phys_vmcs, stack_top, guest, virt_gdt, virt_tss) {
         Ok(_) => 0,
-        Err(e) => e as i32,
+        Err(e) => return e.repr() + 1_000,
     }
 }

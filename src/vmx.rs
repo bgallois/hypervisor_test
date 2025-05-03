@@ -18,35 +18,147 @@
 //! - 🔒 **Safe Abstractions**: Dangerous operations are wrapped with clear and minimal unsafe blocks.
 //! - ⚙️ **Bare-metal Control**: Direct access to CPU features like MSRs, CRs, and x86 instructions via the `x86` crate.
 //! - 🧩 **Modular & Extensible**: Clean separation of responsibilities between this crate and the kernel module interface.
-use core::ptr;
-use x86::current::paging::BASE_PAGE_SIZE;
-use x86::current::vmx::vmxoff;
-use x86::current::vmx::vmxon;
-use x86::msr;
-use x86::msr::rdmsr;
-use x86::msr::wrmsr;
-use x86::vmx::VmFail;
+use crate::vmcs::VmcsField;
+use core::{arch::asm, ops::Add, ptr};
+use x86::{
+    controlregs::{cr0, cr4},
+    current::{
+        paging::BASE_PAGE_SIZE,
+        vmx::{vmxoff, vmxon},
+    },
+    dtables, msr,
+    msr::{
+        IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1, IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1, rdmsr,
+        wrmsr,
+    },
+    vmx::VmFail,
+};
+
+unsafe extern "C" {
+    fn host_entrypoint();
+}
+
+unsafe extern "C" {
+    fn _guest_first_entry() -> i32;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_gdt() -> usize {
+    let mut gdtr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
+    unsafe {
+        x86::dtables::sgdt(&mut gdtr);
+    }
+    usize::from(gdtr.limit) + 1
+}
+
+pub fn get_current_gdt() -> &'static [GdtEntry] {
+    let mut gdtr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
+    unsafe {
+        x86::dtables::sgdt(&mut gdtr);
+    }
+    let bytes = usize::from(gdtr.limit) + 1;
+    unsafe {
+        core::slice::from_raw_parts(
+            gdtr.base as *const GdtEntry,
+            bytes / core::mem::size_of::<GdtEntry>(),
+        )
+    }
+}
+
+#[derive(Default)]
+pub struct UnpackedGdtEntry {
+    /// The base of the segment.
+    pub base: u64,
+    /// The limit of the segment.
+    pub limit: u64,
+    /// The access rights of the segment.
+    pub access_rights: u32,
+    /// The segment selector.
+    pub selector: u16,
+}
+#[derive(Debug, Clone, Copy)]
+#[allow(unused)]
+#[repr(packed)]
+pub struct GdtEntry {
+    /// Low 16 bits of the segment limit.
+    pub limit_low: u16,
+    /// Low 16 bits of the segment base.
+    pub base_low: u16,
+    /// Middle 8 bits of the segment base.
+    pub base_middle: u8,
+    /// Various flags used to set segment type and access rights.
+    pub access: u8,
+    /// The low 4 bits are part of the limit. The high 4 bits are the
+    /// granularity of the segment and the size.
+    pub granularity: u8,
+    /// High 8 bits of the segment base.
+    pub base_high: u8,
+}
+
+#[allow(unused)]
+#[repr(packed)]
+pub struct GdtEntry64 {
+    /// Low 16 bits of the segment limit.
+    pub limit_low: u16,
+    /// Low 16 bits of the segment base.
+    pub base_low: u16,
+    /// Middle 8 bits of the segment base.
+    pub base_middle: u8,
+    /// Various flags used to set segment type and access rights.
+    pub access: u8,
+    /// The low 4 bits are part of the limit. The high 4 bits are the
+    /// granularity of the segment and the size.
+    pub granularity: u8,
+    /// Higher 8 bits of the segment base.
+    pub base_high: u8,
+    /// Highest 32 bits of the segment base.
+    pub base_highest: u32,
+    /// Reserved 0.
+    pub reserved0: u32,
+}
 
 /// Represents the possible errors encountered during hypervisor initialization.
 ///
 /// Each variant maps to a unique integer code and is designed to be easily
 /// convertible to a C-compatible error code (`i32`). These codes are returned
 /// from the exposed FFI interface to signal structured failures to the kernel module.
-#[repr(i32)]
 pub enum Error {
     /// The CPU does not support VMX operation.
     /// (CPUID.1:ECX[5] is not set)
-    CpuNotSupported = 10,
+    CpuNotSupported,
     /// The IA32_FEATURE_CONTROL MSR is locked and does not allow VMX outside SMX.
-    VMXBIOSLock = 20,
+    VMXBIOSLock,
     /// The provided VMXON memory region is not 4KB aligned.
-    MemoryIsNotAligned = 30,
+    MemoryIsNotAligned,
     /// VMXON failed and VM-instruction error was returned (VMfailValid).
     /// Indicates a specific failure code is available in VM-instruction error MSR.
-    VmFailValid = 40,
+    VmFailValid,
     /// VMXON failed and no further error information is available (VMfailInvalid).
     /// Likely indicates an incorrect setup of the VMXON region or control state.
-    VmFailInvalid = 41,
+    VmFailInvalid,
+    Unknown(i32),
+}
+
+impl Error {
+    pub fn repr(&self) -> i32 {
+        match self {
+            Error::CpuNotSupported => 10,
+            Error::VMXBIOSLock => 20,
+            Error::MemoryIsNotAligned => 30,
+            Error::VmFailValid => 40,
+            Error::VmFailInvalid => 41,
+            Error::Unknown(code) => *code,
+        }
+    }
+}
+
+impl From<VmFail> for Error {
+    fn from(value: VmFail) -> Self {
+        match value {
+            VmFail::VmFailValid => Self::VmFailValid,
+            VmFail::VmFailInvalid => Self::VmFailInvalid,
+        }
+    }
 }
 
 /// Represents the default initialization of a VMXON region.
@@ -148,26 +260,250 @@ impl Hypervisor {
             //ptr::write(virt as *mut Vmxon, self.vmxon.clone()); // Relocation error with my
             // compiler but should work
             ptr::write(virt, self.vmxon.revision_id);
-            match vmxon(phys) {
-                Ok(_) => Ok(()),
-                Err(e) => match e {
-                    VmFail::VmFailValid => Err(Error::VmFailValid),
-                    VmFail::VmFailInvalid => Err(Error::VmFailInvalid),
-                },
-            }
+            vmxon(phys)?;
         }
+        Ok(())
     }
 
     pub fn disable(&self) -> Result<(), Error> {
         unsafe {
-            match vmxoff() {
-                Ok(_) => Ok(()),
-                Err(e) => match e {
-                    VmFail::VmFailValid => Err(Error::VmFailValid),
-                    VmFail::VmFailInvalid => Err(Error::VmFailInvalid),
-                },
+            vmxoff()?;
+        }
+        Ok(())
+    }
+
+    fn vmwrite(&self, field: VmcsField, value: u64) -> Result<(), Error> {
+        unsafe {
+            x86::bits64::vmx::vmwrite(field as u32, value)?;
+        }
+        Ok(())
+    }
+
+    fn vmread(&self, field: VmcsField) -> Result<u64, Error> {
+        unsafe { x86::bits64::vmx::vmread(field as u32).map_err(Into::into) }
+    }
+
+    fn init_host_state(
+        &self,
+        stack_top: u64,
+        virt_gdt: *mut u32,
+        virt_tss: *mut u32,
+    ) -> Result<(), Error> {
+        let cr0 = unsafe { x86::controlregs::cr0() }.bits() as u64;
+        let cr3 = unsafe { x86::controlregs::cr3() };
+        let cr4 = unsafe { x86::controlregs::cr4() }.bits() as u64;
+        self.vmwrite(VmcsField::HostCr0, cr0)?;
+        self.vmwrite(VmcsField::HostCr3, cr3)?;
+        self.vmwrite(VmcsField::HostCr4, cr4)?;
+
+        self.vmwrite(
+            VmcsField::HostCsSelector,
+            u64::from(x86::segmentation::cs().bits()),
+        )?;
+        self.vmwrite(
+            VmcsField::HostDsSelector,
+            u64::from(x86::segmentation::ds().bits()),
+        )?;
+        self.vmwrite(
+            VmcsField::HostEsSelector,
+            u64::from(x86::segmentation::es().bits()),
+        )?;
+        self.vmwrite(
+            VmcsField::HostFsSelector,
+            u64::from(x86::segmentation::fs().bits()),
+        )?;
+        self.vmwrite(
+            VmcsField::HostGsSelector,
+            u64::from(x86::segmentation::gs().bits()),
+        )?;
+        self.vmwrite(
+            VmcsField::HostSsSelector,
+            u64::from(x86::segmentation::ss().bits()),
+        )?;
+
+        let mut idtr: dtables::DescriptorTablePointer<u64> = Default::default();
+        unsafe {
+            dtables::sidt(&mut idtr);
+        }
+        self.vmwrite(VmcsField::HostIdtrBase, idtr.base as u64)?;
+
+        let host_fs_base = unsafe { msr::rdmsr(msr::IA32_FS_BASE) };
+        self.vmwrite(VmcsField::HostFsBase, host_fs_base)?;
+
+        let tr_selector = u16::try_from(0x28).map_err(|_| Error::Unknown(-1))?;
+        self.vmwrite(VmcsField::HostTrSelector, tr_selector as u64)?;
+        self.vmwrite(VmcsField::HostTrBase, virt_tss as u64)?;
+
+        self.vmwrite(VmcsField::HostGdtrBase, virt_gdt as *mut u64 as u64)?;
+
+        self.vmwrite(VmcsField::HostGsBase, 0)?;
+
+        self.vmwrite(VmcsField::HostRsp, stack_top)?;
+        self.vmwrite(VmcsField::HostRip, host_entrypoint as usize as u64)?;
+        Ok(())
+    }
+
+    pub fn unpack_gdt_entry(&self, gdt: &[GdtEntry], selector: u16) -> UnpackedGdtEntry {
+        const GDT_ENTRY_ACCESS_PRESENT: u8 = 1 << 7;
+        const VMX_INFO_SEGMENT_UNUSABLE: u32 = 1 << 16;
+
+        let mut unpacked: UnpackedGdtEntry = Default::default();
+
+        let index: usize = usize::from(selector) / core::mem::size_of::<u64>();
+        if index == 0 {
+            unpacked.access_rights |= VMX_INFO_SEGMENT_UNUSABLE;
+            return unpacked;
+        }
+
+        unsafe {
+            unpacked.selector = selector;
+            unpacked.limit = u64::from(gdt.get_unchecked(index).limit_low)
+                | ((u64::from(gdt.get_unchecked(index).granularity) & 0x0f) << 16);
+            unpacked.base = u64::from(gdt.get_unchecked(index).base_low);
+            unpacked.base = (u64::from(gdt.get_unchecked(index).base_high) << 24)
+                | (u64::from(gdt.get_unchecked(index).base_middle) << 16)
+                | u64::from(gdt.get_unchecked(index).base_low);
+
+            unpacked.access_rights = u32::from(gdt.get_unchecked(index).access);
+            unpacked.access_rights |= u32::from((gdt.get_unchecked(index).granularity) & 0xf0) << 8;
+            unpacked.access_rights &= 0xf0ff;
+            if (gdt.get_unchecked(index).access & GDT_ENTRY_ACCESS_PRESENT) == 0 {
+                unpacked.access_rights |= VMX_INFO_SEGMENT_UNUSABLE;
             }
         }
+        unpacked
+    }
+
+    fn init_guest_state(&self) -> Result<(), Error> {
+        let cr0 = 0x80000001u64;
+        let cr3 = unsafe { x86::controlregs::cr3() };
+        let cr4 = 0x00000010u64;
+        self.vmwrite(VmcsField::GuestCr0, cr0)?;
+        self.vmwrite(VmcsField::GuestCr3, cr3)?;
+        self.vmwrite(VmcsField::GuestCr4, cr4)?;
+
+        self.vmwrite(
+            VmcsField::GuestCsSelector,
+            u64::from(x86::segmentation::cs().bits()),
+        )?;
+        self.vmwrite(
+            VmcsField::GuestDsSelector,
+            u64::from(x86::segmentation::ds().bits()),
+        )?;
+        self.vmwrite(
+            VmcsField::GuestEsSelector,
+            u64::from(x86::segmentation::es().bits()),
+        )?;
+        self.vmwrite(
+            VmcsField::GuestFsSelector,
+            u64::from(x86::segmentation::fs().bits()),
+        )?;
+        self.vmwrite(
+            VmcsField::GuestGsSelector,
+            u64::from(x86::segmentation::gs().bits()),
+        )?;
+        self.vmwrite(
+            VmcsField::GuestSsSelector,
+            u64::from(x86::segmentation::ss().bits()),
+        )?;
+
+        let mut idtr: dtables::DescriptorTablePointer<u64> = Default::default();
+        unsafe {
+            dtables::sidt(&mut idtr);
+        }
+        self.vmwrite(VmcsField::GuestIdtrBase, idtr.base as u64)?;
+
+        let guest_fs_base = unsafe { msr::rdmsr(msr::IA32_FS_BASE) };
+        self.vmwrite(VmcsField::GuestFsBase, guest_fs_base)?;
+
+        self.vmwrite(VmcsField::GuestRFlags, 0x00000000)?;
+
+        self.vmwrite(VmcsField::GuestGdtrBase, 0)?;
+        self.vmwrite(VmcsField::GuestTrBase, 0)?;
+
+        Ok(())
+    }
+
+    fn adjust_control(&self, msr: u32, control: u64) -> u64 {
+        let value = unsafe { msr::rdmsr(msr) };
+        let fixed0 = value as u32;
+        let fixed1 = (value >> 32) as u32;
+
+        u64::from((fixed0 | control as u32) & fixed1)
+    }
+
+    fn init_vm_control(&self) -> Result<(), Error> {
+        const CPU_BASED_HLT_EXITING: u64 = 1 << 7;
+        const PIN_BASED_EXT_INTR_EXITING: u64 = 1 << 0;
+        const CPU_BASED_CPUID_EXITING: u64 = 1 << 9;
+        const SECONDARY_EXEC_ENABLE_VMX_PREEMPTION_TIMER: u64 = 1 << 14;
+        const EXIT_SAVE_DEBUG_CONTROLS: u64 = 1 << 0;
+
+        let cpu_based_ctls = self.adjust_control(
+            msr::IA32_VMX_PROCBASED_CTLS,
+            CPU_BASED_HLT_EXITING | CPU_BASED_CPUID_EXITING,
+        );
+        self.vmwrite(VmcsField::CpuBasedVmExecControl, cpu_based_ctls)?;
+
+        let vm_exit_controls =
+            self.adjust_control(msr::IA32_VMX_EXIT_CTLS, EXIT_SAVE_DEBUG_CONTROLS);
+        self.vmwrite(VmcsField::VmExitControls, vm_exit_controls)?;
+
+        Ok(())
+    }
+
+    fn graceful_exit(&self) {}
+
+    pub fn load_vm(
+        &self,
+        virt: *mut u32,
+        phys: u64,
+        stack_top: u64,
+        guest: u64,
+        virt_gdt: *mut u32,
+        virt_tss: *mut u32,
+    ) -> Result<(), Error> {
+        if !self.is_page_aligned(virt as u64) {
+            return Err(Error::MemoryIsNotAligned);
+        }
+        if !self.is_page_aligned(phys) {
+            return Err(Error::MemoryIsNotAligned);
+        }
+        unsafe {
+            ptr::write(virt, self.vmxon.revision_id);
+            x86::bits64::vmx::vmclear(phys)?;
+            x86::bits64::vmx::vmptrld(phys)?;
+        }
+        self.init_vm_control()?;
+        self.init_host_state(stack_top, virt_gdt, virt_tss)?;
+        self.init_guest_state()?;
+
+        if let Err(e) = self.vmread(VmcsField::VmInstructionError) {
+            return Err(Error::Unknown(99));
+        }
+
+        /*let guest_first_entry_result = unsafe { _guest_first_entry() };
+        match guest_first_entry_result {
+            0 => Ok(()),
+            e => Err(Error::Unknown(e)),
+        }?;*/
+
+        if let Err(e) = self.vmread(VmcsField::VmInstructionError) {
+            return Err(Error::Unknown(99));
+        }
+        Ok(())
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn handle_vm_exit() {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vmresume_failure() {}
+
+impl Drop for Hypervisor {
+    fn drop(&mut self) {
+        let _ = self.disable();
     }
 }
 
@@ -197,9 +533,8 @@ impl HypervisorBuilder {
     fn can_vmx() -> bool {
         const CPUID_PROCESSOR_INFO: u32 = 0x1;
         const VMX_AVAILABLE_BIT: u32 = 1 << 5;
-        const HYPERVISOR_PRESENT_BIT: u32 = 1 << 31;
         let result = unsafe { core::arch::x86_64::__cpuid(CPUID_PROCESSOR_INFO) };
-        (result.ecx & VMX_AVAILABLE_BIT != 0) && (result.ecx & HYPERVISOR_PRESENT_BIT == 0)
+        result.ecx & VMX_AVAILABLE_BIT != 0
     }
 
     /// Sets the CR4 control register with VMX-compatible values.
@@ -224,7 +559,6 @@ impl HypervisorBuilder {
         let mut cr4 = unsafe { x86::controlregs::cr4() };
         cr4 |= x86::controlregs::Cr4::from_bits_truncate(fixed0 as usize);
         cr4 &= x86::controlregs::Cr4::from_bits_truncate(fixed1 as usize);
-        cr4 |= x86::controlregs::Cr4::CR4_ENABLE_VME;
         unsafe {
             x86::controlregs::cr4_write(cr4);
         }
