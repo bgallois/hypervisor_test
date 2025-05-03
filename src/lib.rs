@@ -13,6 +13,7 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+pub mod vmcs;
 pub mod vmx;
 
 /// Entry point to load and run the hypervisor logic.
