@@ -17,8 +17,7 @@ hypervisor_module.ko: libhypervisor_test.o
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
 $(RUST_LIB_PATH):
-	cargo rustc --release -- --emit=obj
-
+	cargo rustc --release -- --emit=obj -C target-cpu=x86-64 -C relocation-model=static -C link-arg=-no-pie -C target-feature=-crt-static -C target-cpu=native -C panic=abort -C link-args=-mcmodel=kernel
 libhypervisor_test.o: $(RUST_LIB_PATH)
 	@cp target/$(RUST_RELEASE)/deps/hypervisor_test-*.o src/$@
 	@echo "cmd_target/$(RUST_RELEASE)/deps/hypervisor_test-*.o := cp $< src/$@" > src/.libhypervisor_test.o.cmd
