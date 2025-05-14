@@ -21,7 +21,7 @@
 use crate::vmcs::VmcsField;
 use core::{arch::asm, ops::Add, ptr};
 use x86::{
-    controlregs::{cr0, cr4},
+    controlregs::{Cr0, Cr4, cr0, cr0_write, cr4, cr4_write},
     current::{
         paging::BASE_PAGE_SIZE,
         vmx::{vmxoff, vmxon},
@@ -42,79 +42,16 @@ unsafe extern "C" {
     fn _guest_first_entry() -> i32;
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn get_gdt() -> usize {
-    let mut gdtr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
-    unsafe {
-        x86::dtables::sgdt(&mut gdtr);
-    }
-    usize::from(gdtr.limit) + 1
-}
-
-pub fn get_current_gdt() -> &'static [GdtEntry] {
-    let mut gdtr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
-    unsafe {
-        x86::dtables::sgdt(&mut gdtr);
-    }
-    let bytes = usize::from(gdtr.limit) + 1;
-    unsafe {
-        core::slice::from_raw_parts(
-            gdtr.base as *const GdtEntry,
-            bytes / core::mem::size_of::<GdtEntry>(),
-        )
-    }
-}
-
-#[derive(Default)]
-pub struct UnpackedGdtEntry {
-    /// The base of the segment.
-    pub base: u64,
-    /// The limit of the segment.
-    pub limit: u64,
-    /// The access rights of the segment.
-    pub access_rights: u32,
-    /// The segment selector.
-    pub selector: u16,
-}
-#[derive(Debug, Clone, Copy)]
-#[allow(unused)]
-#[repr(packed)]
-pub struct GdtEntry {
-    /// Low 16 bits of the segment limit.
-    pub limit_low: u16,
-    /// Low 16 bits of the segment base.
-    pub base_low: u16,
-    /// Middle 8 bits of the segment base.
-    pub base_middle: u8,
-    /// Various flags used to set segment type and access rights.
-    pub access: u8,
-    /// The low 4 bits are part of the limit. The high 4 bits are the
-    /// granularity of the segment and the size.
-    pub granularity: u8,
-    /// High 8 bits of the segment base.
-    pub base_high: u8,
-}
-
-#[allow(unused)]
-#[repr(packed)]
-pub struct GdtEntry64 {
-    /// Low 16 bits of the segment limit.
-    pub limit_low: u16,
-    /// Low 16 bits of the segment base.
-    pub base_low: u16,
-    /// Middle 8 bits of the segment base.
-    pub base_middle: u8,
-    /// Various flags used to set segment type and access rights.
-    pub access: u8,
-    /// The low 4 bits are part of the limit. The high 4 bits are the
-    /// granularity of the segment and the size.
-    pub granularity: u8,
-    /// Higher 8 bits of the segment base.
-    pub base_high: u8,
-    /// Highest 32 bits of the segment base.
-    pub base_highest: u32,
-    /// Reserved 0.
-    pub reserved0: u32,
+#[repr(C, packed)]
+pub struct TssDescriptor {
+    limit_low: u16,
+    base_low: u16,
+    base_middle: u8,
+    access: u8,
+    granularity: u8,
+    base_high: u8,
+    base_upper: u32,
+    reserved: u32,
 }
 
 /// Represents the possible errors encountered during hypervisor initialization.
@@ -283,12 +220,7 @@ impl Hypervisor {
         unsafe { x86::bits64::vmx::vmread(field as u32).map_err(Into::into) }
     }
 
-    fn init_host_state(
-        &self,
-        stack_top: u64,
-        virt_gdt: *mut u32,
-        virt_tss: *mut u32,
-    ) -> Result<(), Error> {
+    fn init_host_state(&self, stack_top: u64) -> Result<(), Error> {
         let cr0 = unsafe { x86::controlregs::cr0() }.bits() as u64;
         let cr3 = unsafe { x86::controlregs::cr3() };
         let cr4 = unsafe { x86::controlregs::cr4() }.bits() as u64;
@@ -321,6 +253,12 @@ impl Hypervisor {
             u64::from(x86::segmentation::ss().bits()),
         )?;
 
+        let tr: u16;
+        unsafe {
+            asm!("str {}", out(reg) tr);
+        }
+        self.vmwrite(VmcsField::HostTrSelector, tr as u64)?;
+
         let mut idtr: dtables::DescriptorTablePointer<u64> = Default::default();
         unsafe {
             dtables::sidt(&mut idtr);
@@ -330,96 +268,109 @@ impl Hypervisor {
         let host_fs_base = unsafe { msr::rdmsr(msr::IA32_FS_BASE) };
         self.vmwrite(VmcsField::HostFsBase, host_fs_base)?;
 
-        let tr_selector = u16::try_from(0x28).map_err(|_| Error::Unknown(-1))?;
-        self.vmwrite(VmcsField::HostTrSelector, tr_selector as u64)?;
-        self.vmwrite(VmcsField::HostTrBase, virt_tss as u64)?;
+        let mut gdt_ptr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
+        unsafe {
+            x86::dtables::sgdt(&mut gdt_ptr);
+        }
+        let gdt_base = gdt_ptr.base as *const TssDescriptor;
+        let tr_index = (tr >> 3) as isize;
+        let tss_desc = unsafe { &*gdt_base.offset(tr_index) };
+        let tss_base = (tss_desc.base_low as u64)
+            | ((tss_desc.base_middle as u64) << 16)
+            | ((tss_desc.base_high as u64) << 24)
+            | ((tss_desc.base_upper as u64) << 32);
 
-        self.vmwrite(VmcsField::HostGdtrBase, virt_gdt as *mut u64 as u64)?;
+        self.vmwrite(VmcsField::HostTrBase, tss_base)?;
 
-        self.vmwrite(VmcsField::HostGsBase, 0)?;
+        self.vmwrite(VmcsField::HostGdtrBase, gdt_ptr.base as u64)?;
+
+        let host_gs_base = unsafe { msr::rdmsr(msr::IA32_GS_BASE) };
+        self.vmwrite(VmcsField::HostGsBase, host_gs_base)?;
 
         self.vmwrite(VmcsField::HostRsp, stack_top)?;
         self.vmwrite(VmcsField::HostRip, host_entrypoint as usize as u64)?;
         Ok(())
     }
 
-    pub fn unpack_gdt_entry(&self, gdt: &[GdtEntry], selector: u16) -> UnpackedGdtEntry {
-        const GDT_ENTRY_ACCESS_PRESENT: u8 = 1 << 7;
-        const VMX_INFO_SEGMENT_UNUSABLE: u32 = 1 << 16;
-
-        let mut unpacked: UnpackedGdtEntry = Default::default();
-
-        let index: usize = usize::from(selector) / core::mem::size_of::<u64>();
-        if index == 0 {
-            unpacked.access_rights |= VMX_INFO_SEGMENT_UNUSABLE;
-            return unpacked;
-        }
-
-        unsafe {
-            unpacked.selector = selector;
-            unpacked.limit = u64::from(gdt.get_unchecked(index).limit_low)
-                | ((u64::from(gdt.get_unchecked(index).granularity) & 0x0f) << 16);
-            unpacked.base = u64::from(gdt.get_unchecked(index).base_low);
-            unpacked.base = (u64::from(gdt.get_unchecked(index).base_high) << 24)
-                | (u64::from(gdt.get_unchecked(index).base_middle) << 16)
-                | u64::from(gdt.get_unchecked(index).base_low);
-
-            unpacked.access_rights = u32::from(gdt.get_unchecked(index).access);
-            unpacked.access_rights |= u32::from((gdt.get_unchecked(index).granularity) & 0xf0) << 8;
-            unpacked.access_rights &= 0xf0ff;
-            if (gdt.get_unchecked(index).access & GDT_ENTRY_ACCESS_PRESENT) == 0 {
-                unpacked.access_rights |= VMX_INFO_SEGMENT_UNUSABLE;
-            }
-        }
-        unpacked
-    }
-
     fn init_guest_state(&self) -> Result<(), Error> {
-        let cr0 = 0x80000001u64;
+        let cr0 = unsafe { x86::controlregs::cr0() }.bits() as u64;
         let cr3 = unsafe { x86::controlregs::cr3() };
-        let cr4 = 0x00000010u64;
+        let cr4 = unsafe { x86::controlregs::cr4() }.bits() as u64;
         self.vmwrite(VmcsField::GuestCr0, cr0)?;
         self.vmwrite(VmcsField::GuestCr3, cr3)?;
         self.vmwrite(VmcsField::GuestCr4, cr4)?;
+        let guest_debug = unsafe { x86::msr::rdmsr(x86::msr::IA32_DEBUGCTL) };
+        self.vmwrite(VmcsField::GuestIA32Debugctl, guest_debug)?;
 
-        self.vmwrite(
-            VmcsField::GuestCsSelector,
-            u64::from(x86::segmentation::cs().bits()),
-        )?;
-        self.vmwrite(
-            VmcsField::GuestDsSelector,
-            u64::from(x86::segmentation::ds().bits()),
-        )?;
-        self.vmwrite(
-            VmcsField::GuestEsSelector,
-            u64::from(x86::segmentation::es().bits()),
-        )?;
-        self.vmwrite(
-            VmcsField::GuestFsSelector,
-            u64::from(x86::segmentation::fs().bits()),
-        )?;
-        self.vmwrite(
-            VmcsField::GuestGsSelector,
-            u64::from(x86::segmentation::gs().bits()),
-        )?;
-        self.vmwrite(
-            VmcsField::GuestSsSelector,
-            u64::from(x86::segmentation::ss().bits()),
-        )?;
+        let cs = x86::segmentation::cs().bits();
+        let ds = x86::segmentation::ds().bits();
+        let es = x86::segmentation::es().bits();
+        let fs = x86::segmentation::fs().bits();
+        let gs = x86::segmentation::gs().bits();
+        let ss = x86::segmentation::ss().bits();
 
-        let mut idtr: dtables::DescriptorTablePointer<u64> = Default::default();
+        self.vmwrite(VmcsField::GuestCsSelector, cs as u64)?;
+        self.vmwrite(VmcsField::GuestCsBase, 0)?;
+        self.vmwrite(VmcsField::GuestCsLimit, 0xFFFF)?;
+        self.vmwrite(VmcsField::GuestCsArBytes, 0x9B)?;
+
+        self.vmwrite(VmcsField::GuestDsSelector, ds as u64)?;
+        self.vmwrite(VmcsField::GuestDsBase, 0)?;
+        self.vmwrite(VmcsField::GuestDsLimit, 0xFFFF)?;
+        self.vmwrite(VmcsField::GuestDsArBytes, 0x93)?;
+
+        self.vmwrite(VmcsField::GuestEsSelector, es as u64)?;
+        self.vmwrite(VmcsField::GuestEsBase, 0)?;
+        self.vmwrite(VmcsField::GuestEsLimit, 0xFFFF)?;
+        self.vmwrite(VmcsField::GuestEsArBytes, 0x93)?;
+
+        self.vmwrite(VmcsField::GuestFsSelector, fs as u64)?;
+        self.vmwrite(VmcsField::GuestFsBase, 0)?;
+        self.vmwrite(VmcsField::GuestFsLimit, 0xFFFF)?;
+        self.vmwrite(VmcsField::GuestFsArBytes, 0x93)?;
+
+        self.vmwrite(VmcsField::GuestGsSelector, gs as u64)?;
+        self.vmwrite(VmcsField::GuestGsBase, 0)?;
+        self.vmwrite(VmcsField::GuestGsLimit, 0xFFFF)?;
+        self.vmwrite(VmcsField::GuestGsArBytes, 0x93)?;
+
+        self.vmwrite(VmcsField::GuestSsSelector, ss as u64)?;
+        self.vmwrite(VmcsField::GuestSsBase, 0)?;
+        self.vmwrite(VmcsField::GuestSsLimit, 0xFFFF)?;
+        self.vmwrite(VmcsField::GuestSsArBytes, 0x93)?;
+
+        let mut gdt_ptr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
+        unsafe { x86::dtables::sgdt(&mut gdt_ptr) };
+
+        let tr: u16;
         unsafe {
-            dtables::sidt(&mut idtr);
+            core::arch::asm!("str {}", out(reg) tr);
         }
+
+        let gdt_base = gdt_ptr.base as *const TssDescriptor;
+        let tr_index = (tr >> 3) as isize;
+        let tss_desc = unsafe { &*gdt_base.offset(tr_index) };
+        let tss_base = (tss_desc.base_low as u64)
+            | ((tss_desc.base_middle as u64) << 16)
+            | ((tss_desc.base_high as u64) << 24)
+            | ((tss_desc.base_upper as u64) << 32);
+
+        self.vmwrite(VmcsField::GuestTrSelector, tr as u64)?;
+        self.vmwrite(VmcsField::GuestTrBase, tss_base)?;
+        self.vmwrite(VmcsField::GuestTrLimit, 0xFFFF)?;
+        self.vmwrite(VmcsField::GuestTrArBytes, 0x8B)?;
+        self.vmwrite(VmcsField::GuestGdtrBase, gdt_ptr.base as u64)?;
+
+        let mut idtr: x86::dtables::DescriptorTablePointer<u64> = Default::default();
+        unsafe { x86::dtables::sidt(&mut idtr) };
         self.vmwrite(VmcsField::GuestIdtrBase, idtr.base as u64)?;
 
-        let guest_fs_base = unsafe { msr::rdmsr(msr::IA32_FS_BASE) };
+        let guest_fs_base = unsafe { x86::msr::rdmsr(x86::msr::IA32_FS_BASE) };
+        let guest_gs_base = unsafe { x86::msr::rdmsr(x86::msr::IA32_GS_BASE) };
+
         self.vmwrite(VmcsField::GuestFsBase, guest_fs_base)?;
-
-        self.vmwrite(VmcsField::GuestRFlags, 0x00000000)?;
-
-        self.vmwrite(VmcsField::GuestGdtrBase, 0)?;
-        self.vmwrite(VmcsField::GuestTrBase, 0)?;
+        self.vmwrite(VmcsField::GuestGsBase, guest_gs_base)?;
+        self.vmwrite(VmcsField::GuestRFlags, 0x2)?;
 
         Ok(())
     }
@@ -434,35 +385,33 @@ impl Hypervisor {
 
     fn init_vm_control(&self) -> Result<(), Error> {
         const CPU_BASED_HLT_EXITING: u64 = 1 << 7;
+        const CPU_BASED_CPUID_EXITING: u64 = 1 << 21;
         const PIN_BASED_EXT_INTR_EXITING: u64 = 1 << 0;
-        const CPU_BASED_CPUID_EXITING: u64 = 1 << 9;
-        const SECONDARY_EXEC_ENABLE_VMX_PREEMPTION_TIMER: u64 = 1 << 14;
-        const EXIT_SAVE_DEBUG_CONTROLS: u64 = 1 << 0;
 
-        let cpu_based_ctls = self.adjust_control(
-            msr::IA32_VMX_PROCBASED_CTLS,
-            CPU_BASED_HLT_EXITING | CPU_BASED_CPUID_EXITING,
-        );
+        let pin_based_ctls =
+            self.adjust_control(msr::IA32_VMX_PINBASED_CTLS, PIN_BASED_EXT_INTR_EXITING);
+        self.vmwrite(VmcsField::PinBasedVmExecControl, pin_based_ctls)?;
+
+        let cpu_based_ctls_raw = CPU_BASED_HLT_EXITING | CPU_BASED_CPUID_EXITING;
+        let cpu_based_ctls = self.adjust_control(msr::IA32_VMX_PROCBASED_CTLS, cpu_based_ctls_raw);
         self.vmwrite(VmcsField::CpuBasedVmExecControl, cpu_based_ctls)?;
 
-        let vm_exit_controls =
-            self.adjust_control(msr::IA32_VMX_EXIT_CTLS, EXIT_SAVE_DEBUG_CONTROLS);
-        self.vmwrite(VmcsField::VmExitControls, vm_exit_controls)?;
+        let procbased_ctls2 = if cpu_based_ctls & (1 << 31) != 0 {
+            self.adjust_control(msr::IA32_VMX_PROCBASED_CTLS2, 0)
+        } else {
+            0
+        };
+        self.vmwrite(VmcsField::SecondaryVmExecControl, procbased_ctls2)?;
 
+        let exit_controls = self.adjust_control(msr::IA32_VMX_EXIT_CTLS, 1 << 9);
+        self.vmwrite(VmcsField::VmExitControls, exit_controls)?;
+
+        let entry_controls = self.adjust_control(msr::IA32_VMX_ENTRY_CTLS, 1 << 9);
+        self.vmwrite(VmcsField::VmEntryControls, entry_controls)?;
         Ok(())
     }
 
-    fn graceful_exit(&self) {}
-
-    pub fn load_vm(
-        &self,
-        virt: *mut u32,
-        phys: u64,
-        stack_top: u64,
-        guest: u64,
-        virt_gdt: *mut u32,
-        virt_tss: *mut u32,
-    ) -> Result<(), Error> {
+    pub fn load_vm(&self, virt: *mut u32, phys: u64, stack_top: u64) -> Result<(), Error> {
         if !self.is_page_aligned(virt as u64) {
             return Err(Error::MemoryIsNotAligned);
         }
@@ -475,28 +424,39 @@ impl Hypervisor {
             x86::bits64::vmx::vmptrld(phys)?;
         }
         self.init_vm_control()?;
-        self.init_host_state(stack_top, virt_gdt, virt_tss)?;
+        self.init_host_state(stack_top)?;
         self.init_guest_state()?;
 
-        if let Err(e) = self.vmread(VmcsField::VmInstructionError) {
-            return Err(Error::Unknown(99));
-        }
-
-        /*let guest_first_entry_result = unsafe { _guest_first_entry() };
+        let guest_first_entry_result = unsafe { _guest_first_entry() };
         match guest_first_entry_result {
             0 => Ok(()),
-            e => Err(Error::Unknown(e)),
-        }?;*/
+            _ => {
+                if let Ok(e) = self.vmread(VmcsField::VmInstructionError) {
+                    Err(Error::Unknown(e as i32))
+                } else {
+                    Err(Error::Unknown(98))
+                }
+            }
+        }?;
 
-        if let Err(e) = self.vmread(VmcsField::VmInstructionError) {
-            return Err(Error::Unknown(99));
-        }
         Ok(())
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn handle_vm_exit() {}
+pub extern "C" fn handle_vm_exit() {
+    unsafe {
+        let reason = x86::current::vmx::vmread(VmcsField::VmExitReason as u32).unwrap_or(0);
+        let qualification =
+            x86::current::vmx::vmread(VmcsField::ExitQualification as u32).unwrap_or(0);
+        let guest_rip = x86::current::vmx::vmread(VmcsField::GuestRip as u32).unwrap_or(0);
+        if reason & 0xffff == 12 {
+            let instr_len =
+                x86::current::vmx::vmread(VmcsField::VmExitInstructionLen as u32).unwrap_or(0);
+            x86::current::vmx::vmwrite(VmcsField::GuestRip as u32, guest_rip + instr_len).ok();
+        }
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vmresume_failure() {}
@@ -619,6 +579,26 @@ impl HypervisorBuilder {
             return Ok(());
         } else if (control & IA32_FEATURE_CONTROL_VMX_ENABLED_OUTSIDE_SMX_BIT) == 0 {
             return Err(Error::VMXBIOSLock);
+        }
+        Ok(())
+    }
+
+    pub fn set_long_mode() -> Result<(), Error> {
+        unsafe {
+            let mut current_cr4 = cr4();
+            current_cr4.insert(Cr4::CR4_ENABLE_PAE);
+            cr4_write(current_cr4);
+
+            let mut efer = msr::rdmsr(msr::IA32_EFER);
+            efer |= 1 << 8;
+            msr::wrmsr(msr::IA32_EFER, efer);
+
+            //cr3_write(pml4_phys_addr);
+
+            let mut current_cr0 = cr0();
+            current_cr0.insert(Cr0::CR0_ENABLE_PAGING);
+            current_cr0.insert(Cr0::CR0_PROTECTED_MODE);
+            cr0_write(current_cr0);
         }
         Ok(())
     }

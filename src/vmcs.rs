@@ -142,7 +142,7 @@ pub enum VmcsField {
     Cr3TargetValue1 = 0x0000_600a,
     Cr3TargetValue2 = 0x0000_600c,
     Cr3TargetValue3 = 0x0000_600e,
-    ExitQualificatIon = 0x0000_6400,
+    ExitQualification = 0x0000_6400,
     GuestLinearAddress = 0x0000_640a,
     GuestCr0 = 0x0000_6800,
     GuestCr3 = 0x0000_6802,

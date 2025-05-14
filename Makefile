@@ -5,6 +5,8 @@ KERNELDIR :=../linux # Should be replaced to the kernel build
 PWD := $(shell pwd)
 
 EXTRA_CFLAGS += -mcmodel=kernel -fno-pic
+KBUILD_EXTRA_SYMBOLS =
+CFLAGS_mymodule.o := -g
 
 RUST_RELEASE := release
 RUST_LIB_NAME := hypervisor_test

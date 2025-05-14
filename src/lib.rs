@@ -40,9 +40,6 @@ pub extern "C" fn load_hypervisor(
     phys_vmcs: u64,
     virt_stack: *mut u32,
     stack_top: u64,
-    guest: u64,
-    virt_gdt: *mut u32,
-    virt_tss: *mut u32,
 ) -> i32 {
     let hypervisor = match vmx::HypervisorBuilder::build() {
         Ok(hypervisor) => hypervisor,
@@ -52,7 +49,7 @@ pub extern "C" fn load_hypervisor(
         Ok(_) => 0,
         Err(e) => return e.repr() + 100,
     };
-    match hypervisor.load_vm(virt_vmcs, phys_vmcs, stack_top, guest, virt_gdt, virt_tss) {
+    match hypervisor.load_vm(virt_vmcs, phys_vmcs, stack_top) {
         Ok(_) => 0,
         Err(e) => return e.repr() + 1_000,
     }
